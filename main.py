@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client
+from typing import Optional
 
 load_dotenv()
 
@@ -74,11 +75,11 @@ class LeadRequest(BaseModel):
     user_id: str = ""
     name: str = ""
     email: str = ""
-    intent: str = ""
-    budget: str = ""
-    timeline: str = ""
-    urgency: str = "low"
-    conversation: str = ""
+    intent: Optional[str] = None
+    budget: Optional[str] = None
+    timeline: Optional[str] = None
+    urgency: Optional[str] = "low"
+    conversation: Optional[str] = None
 # --- Routes ---
 import json
 
