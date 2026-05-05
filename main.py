@@ -83,6 +83,65 @@ class LeadRequest(BaseModel):
 # --- Routes ---
 import json
 
+@app.post("/train")
+def train(req: TrainRequest):
+    collection = get_collection(req.user_id)
+    links = get_all_links(req.url)
+    links = links[:20]
+    all_chunks = []
+    for link in links:
+        try:
+            text = scrape_website(link)
+            all_chunks.extend(chunk_text(text))
+        except:
+            pass
+    if all_chunks:
+        for i, chunk in enumerate(all_chunks):
+            try:
+                collection.add(documents=[chunk], ids=[f"chunk_{i}_{req.user_id}"])
+            except:
+                collection.update(documents=[chunk], ids=[f"chunk_{i}_{req.user_id}"])
+
+    # Auto-generate FAQ buttons
+    faq_buttons = ["Our Services", "Pricing", "Location", "Contact Us"]
+    try:
+        sample_text = " ".join(all_chunks[:5])
+        faq_prompt = f"""Based on this business website content, generate exactly 4 short FAQ button labels visitors would most likely click.
+
+Content: {sample_text[:2000]}
+
+Rules:
+- Each label must be 2-4 words maximum
+- Make them action-oriented or question-based  
+- Return ONLY a JSON array of 4 strings, nothing else
+- Example: ["Our Services", "Pricing", "Book Now", "Contact Us"]"""
+
+        faq_response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": faq_prompt}],
+            temperature=0.3,
+            max_tokens=100,
+        )
+        raw = faq_response.choices[0].message.content.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(raw)
+        if isinstance(parsed, list) and len(parsed) > 0:
+            faq_buttons = parsed[:4]
+    except Exception as e:
+        print(f"FAQ generation error: {e}")
+
+    # Save to Supabase
+    try:
+        existing = supabase.table("chatbot_settings").select("user_id").eq("user_id", req.user_id).execute()
+        if existing.data:
+            supabase.table("chatbot_settings").update({"faq_buttons": faq_buttons}).eq("user_id", req.user_id).execute()
+        else:
+            supabase.table("chatbot_settings").insert({"user_id": req.user_id, "faq_buttons": faq_buttons}).execute()
+    except Exception as e:
+        print(f"FAQ save error: {e}")
+
+    return {"status": "success", "pages_scraped": len(links), "chunks_stored": len(all_chunks), "faq_buttons": faq_buttons}
+
 @app.post("/chat")
 def chat(req: ChatRequest):
     collection = get_collection(req.user_id)
@@ -163,6 +222,7 @@ def get_settings(user_id: str):
             "collectName": data.get("collect_name", True),
             "collectEmail": data.get("collect_email", True),
             "logoUrl": data.get("logo_url", ""),
+            "faqButtons": data.get("faq_buttons", []),
         }
     except Exception as e:
         print(f"Settings error: {e}")
