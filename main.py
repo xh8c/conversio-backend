@@ -68,69 +68,106 @@ class ChatRequest(BaseModel):
     question: str
     bot_name: str = "Assistant"
     fallback_message: str = "I don't have that information, please contact us directly."
+    conversation_history: list = []
 
 class LeadRequest(BaseModel):
     user_id: str
     name: str
     email: str
+    intent: str = None
+    budget: str = None
+    timeline: str = None
+    urgency: str = "low"
+    conversation: str = None
 
 # --- Routes ---
-@app.post("/train")
-def train(req: TrainRequest):
-    collection = get_collection(req.user_id)
-    links = get_all_links(req.url)
-    all_chunks = []
-    for link in links:
-        try:
-            text = scrape_website(link)
-            all_chunks.extend(chunk_text(text))
-        except:
-            pass
-    for i, chunk in enumerate(all_chunks):
-        collection.add(documents=[chunk], ids=[f"chunk_{i}"])
-    return {"status": "success", "pages_scraped": len(links), "chunks_stored": len(all_chunks)}
+import json
 
 @app.post("/chat")
 def chat(req: ChatRequest):
     collection = get_collection(req.user_id)
+
+    # Get relevant chunks
     results = collection.query(query_texts=[req.question], n_results=5)
-    chunks = results["documents"][0]
-    context = " ".join(chunks)
+    context = " ".join(results["documents"][0])
 
-    prompt = f"""You are {req.bot_name}, a smart and helpful AI assistant for this business.
+    # Always fetch contact info
+    contact_results = collection.query(query_texts=["contact phone email address location booking"], n_results=3)
+    contact_context = " ".join(contact_results["documents"][0])
 
-Your job is to help website visitors by answering their questions clearly and in a well-organized way.
+    # Build conversation history string
+    history_str = ""
+    if req.conversation_history:
+        for msg in req.conversation_history[-6:]:  # last 6 messages for context
+            role = "Visitor" if msg["role"] == "user" else req.bot_name
+            history_str += f"{role}: {msg['content']}\n"
 
-CONTEXT FROM BUSINESS WEBSITE:
+    # Main chat response
+    prompt = f"""You are {req.bot_name}, a smart and friendly AI assistant for this business.
+
+BUSINESS INFORMATION:
 {context}
 
-RULES:
-1. Answer using ONLY information from the context above
-2. Format your responses clearly:
-   - Use bullet points for lists
-   - Use numbered steps for processes
-   - Keep paragraphs short and readable
-3. Be warm, professional and conversational
-4. If the context contains partial info, use it and be helpful with what you know
-5. If the question is completely outside the context, respond with:
-   "I don't have specific information about that. To get the right answer, please reach out to the team directly:
-   - [extract any email from context if available]
-   - [extract any phone from context if available]
-   - [extract any address from context if available]
-   They'll be happy to help!"
-6. NEVER make up information not in the context
-7. NEVER say "based on the context" or "according to the document" — just answer naturally
+CONTACT & BOOKING INFO:
+{contact_context}
 
-VISITOR QUESTION: {req.question}
+CONVERSATION SO FAR:
+{history_str}
 
-YOUR RESPONSE:"""
+INSTRUCTIONS:
+- Answer helpfully using business information above
+- Format responses neatly with bullet points for lists
+- Be warm, conversational and professional
+- Detect visitor intent from the conversation
+- If visitor shows buying intent or urgency, naturally guide them toward booking/contact
+- If visitor asks about pricing, give available info then ask about their specific needs
+- If you don't have specific info, provide contact details from above
+- Never say "based on context" or "according to the document"
+- Never make up information
+
+VISITOR: {req.question}
+{req.bot_name}:"""
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
+        temperature=0.4,
     )
-    return {"answer": response.choices[0].message.content}
+    answer = response.choices[0].message.content
+
+    # Silent background extraction
+    extraction_prompt = f"""Extract lead information from this conversation. Return ONLY a valid JSON object, nothing else.
+
+Conversation:
+{history_str}
+Visitor: {req.question}
+Assistant: {answer}
+
+Return this exact JSON structure with null for missing fields:
+{{"intent": null, "budget": null, "timeline": null, "urgency": "low"}}
+
+urgency must be: "high", "medium", or "low"
+Intent should describe what the visitor wants in a few words.
+Budget should be the amount mentioned or null.
+Timeline should be when they want it or null."""
+
+    extracted = {"intent": None, "budget": None, "timeline": None, "urgency": "low"}
+    try:
+        extraction_response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": extraction_prompt}],
+            temperature=0.1,
+        )
+        raw = extraction_response.choices[0].message.content.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        extracted = json.loads(raw)
+    except Exception as e:
+        print(f"Extraction error: {e}")
+
+    return {
+        "answer": answer,
+        "extracted": extracted,
+    }
 
 @app.post("/lead")
 def capture_lead(req: LeadRequest):
@@ -139,6 +176,11 @@ def capture_lead(req: LeadRequest):
             "user_id": req.user_id,
             "name": req.name,
             "email": req.email,
+            "intent": req.intent,
+            "budget": req.budget,
+            "timeline": req.timeline,
+            "urgency": req.urgency,
+            "conversation": req.conversation,
         }).execute()
     except Exception as e:
         print(f"Lead capture error: {e}")
