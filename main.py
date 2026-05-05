@@ -86,44 +86,35 @@ import json
 @app.post("/chat")
 def chat(req: ChatRequest):
     collection = get_collection(req.user_id)
-
-    # Get relevant chunks
     results = collection.query(query_texts=[req.question], n_results=5)
     context = " ".join(results["documents"][0])
-
-    # Always fetch contact info
-    contact_results = collection.query(query_texts=["contact phone email address location booking"], n_results=3)
+    contact_results = collection.query(query_texts=["contact phone email address booking"], n_results=3)
     contact_context = " ".join(contact_results["documents"][0])
 
-    # Build conversation history string
     history_str = ""
     if req.conversation_history:
-        for msg in req.conversation_history[-6:]:  # last 6 messages for context
+        for msg in req.conversation_history[-6:]:
             role = "Visitor" if msg["role"] == "user" else req.bot_name
             history_str += f"{role}: {msg['content']}\n"
 
-    # Main chat response
-    prompt = f"""You are {req.bot_name}, a smart and friendly AI assistant for this business.
+    prompt = f"""You are {req.bot_name}, a smart friendly AI assistant for this business.
 
-BUSINESS INFORMATION:
+BUSINESS INFO:
 {context}
 
-CONTACT & BOOKING INFO:
+CONTACT & BOOKING:
 {contact_context}
 
-CONVERSATION SO FAR:
+CONVERSATION:
 {history_str}
 
 INSTRUCTIONS:
-- Answer helpfully using business information above
-- Format responses neatly with bullet points for lists
-- Be warm, conversational and professional
-- Detect visitor intent from the conversation
-- If visitor shows buying intent or urgency, naturally guide them toward booking/contact
-- If visitor asks about pricing, give available info then ask about their specific needs
-- If you don't have specific info, provide contact details from above
-- Never say "based on context" or "according to the document"
-- Never make up information
+- Answer using only business info above
+- Use bullet points for lists, short paragraphs otherwise
+- Be warm and conversational
+- If visitor shows buying intent, guide toward booking/contact
+- If you lack specific info, share contact details
+- Never say "based on context" or make up info
 
 VISITOR: {req.question}
 {req.bot_name}:"""
@@ -133,41 +124,7 @@ VISITOR: {req.question}
         messages=[{"role": "user", "content": prompt}],
         temperature=0.4,
     )
-    answer = response.choices[0].message.content
-
-    # Silent background extraction
-    extraction_prompt = f"""Extract lead information from this conversation. Return ONLY a valid JSON object, nothing else.
-
-Conversation:
-{history_str}
-Visitor: {req.question}
-Assistant: {answer}
-
-Return this exact JSON structure with null for missing fields:
-{{"intent": null, "budget": null, "timeline": null, "urgency": "low"}}
-
-urgency must be: "high", "medium", or "low"
-Intent should describe what the visitor wants in a few words.
-Budget should be the amount mentioned or null.
-Timeline should be when they want it or null."""
-
-    extracted = {"intent": None, "budget": None, "timeline": None, "urgency": "low"}
-    try:
-        extraction_response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": extraction_prompt}],
-            temperature=0.1,
-        )
-        raw = extraction_response.choices[0].message.content.strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        extracted = json.loads(raw)
-    except Exception as e:
-        print(f"Extraction error: {e}")
-
-    return {
-        "answer": answer,
-        "extracted": extracted,
-    }
+    return {"answer": response.choices[0].message.content}
 
 @app.post("/lead")
 def capture_lead(req: LeadRequest):
@@ -210,3 +167,38 @@ def get_settings(user_id: str):
     except Exception as e:
         print(f"Settings error: {e}")
         return {}
+
+@app.post("/extract")
+def extract_lead_info(req: ChatRequest):
+    history_str = ""
+    if req.conversation_history:
+        for msg in req.conversation_history:
+            role = "Visitor" if msg["role"] == "user" else "Assistant"
+            history_str += f"{role}: {msg['content']}\n"
+
+    extraction_prompt = f"""Extract lead information from this conversation. Return ONLY valid JSON, nothing else.
+
+Conversation:
+{history_str}
+
+Return exactly this structure with null for missing fields:
+{{"intent": null, "budget": null, "timeline": null, "urgency": "low"}}
+
+urgency must be "high", "medium", or "low".
+intent = what they want in a few words.
+budget = amount mentioned or null.
+timeline = when they need it or null."""
+
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": extraction_prompt}],
+            temperature=0.1,
+            max_tokens=100,
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        return json.loads(raw)
+    except Exception as e:
+        print(f"Extraction error: {e}")
+        return {"intent": None, "budget": None, "timeline": None, "urgency": "low"}
