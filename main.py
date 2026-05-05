@@ -129,6 +129,7 @@ Rules:
             faq_buttons = parsed[:4]
     except Exception as e:
         print(f"FAQ generation error: {e}")
+        print(f"FAQ buttons generated: {faq_buttons}")
 
     # Save to Supabase
     try:
