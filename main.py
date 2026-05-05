@@ -120,7 +120,7 @@ VISITOR: {req.question}
 {req.bot_name}:"""
 
     response = client.chat.completions.create(
-        model="llama3-groq-8b-8192-tool-use-preview",
+        model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.4,
     )
@@ -191,7 +191,7 @@ timeline = when they need it or null."""
 
     try:
         response = client.chat.completions.create(
-            model="llama3-groq-8b-8192-tool-use-preview",
+            model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": extraction_prompt}],
             temperature=0.1,
             max_tokens=100,
