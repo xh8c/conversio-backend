@@ -71,15 +71,14 @@ class ChatRequest(BaseModel):
     conversation_history: list = []
 
 class LeadRequest(BaseModel):
-    user_id: str
-    name: str
-    email: str
-    intent: str = None
-    budget: str = None
-    timeline: str = None
+    user_id: str = ""
+    name: str = ""
+    email: str = ""
+    intent: str = ""
+    budget: str = ""
+    timeline: str = ""
     urgency: str = "low"
-    conversation: str = None
-
+    conversation: str = ""
 # --- Routes ---
 import json
 
@@ -133,15 +132,15 @@ def capture_lead(req: LeadRequest):
             "user_id": req.user_id,
             "name": req.name,
             "email": req.email,
-            "intent": req.intent,
-            "budget": req.budget,
-            "timeline": req.timeline,
-            "urgency": req.urgency,
-            "conversation": req.conversation,
+            "intent": req.intent or None,
+            "budget": req.budget or None,
+            "timeline": req.timeline or None,
+            "urgency": req.urgency or "low",
+            "conversation": req.conversation or None,
         }).execute()
     except Exception as e:
-        print(f"Lead capture error: {e}")
-    return {"status": "success", "message": "Lead captured"}
+        print(f"Lead error: {e}")
+    return {"status": "success"}
 
 @app.get("/")
 def root():
