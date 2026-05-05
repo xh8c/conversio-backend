@@ -202,3 +202,50 @@ timeline = when they need it or null."""
     except Exception as e:
         print(f"Extraction error: {e}")
         return {"intent": None, "budget": None, "timeline": None, "urgency": "low"}
+
+class UpdateLeadRequest(BaseModel):
+    user_id: str
+    email: str
+    conversation_history: list = []
+
+@app.post("/update-lead")
+def update_lead(req: UpdateLeadRequest):
+    try:
+        history_str = "\n".join([f"{'Visitor' if m['role'] == 'user' else 'Assistant'}: {m['content']}" for m in req.conversation_history])
+        
+        extraction_prompt = f"""Extract lead information from this conversation. Return ONLY valid JSON.
+
+Conversation:
+{history_str}
+
+Return exactly this structure with null for missing fields:
+{{"intent": null, "budget": null, "timeline": null, "urgency": "low"}}
+
+urgency must be "high", "medium", or "low".
+intent = what they want in a few words.
+budget = amount mentioned or null.
+timeline = when they need it or null."""
+
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": extraction_prompt}],
+            temperature=0.1,
+            max_tokens=100,
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        extracted = json.loads(raw)
+
+        update_data = {
+            "conversation": json.dumps(req.conversation_history),
+        }
+        if extracted.get("intent"): update_data["intent"] = extracted["intent"]
+        if extracted.get("budget"): update_data["budget"] = extracted["budget"]
+        if extracted.get("timeline"): update_data["timeline"] = extracted["timeline"]
+        if extracted.get("urgency"): update_data["urgency"] = extracted["urgency"]
+
+        supabase.table("leads").update(update_data).eq("user_id", req.user_id).eq("email", req.email).execute()
+
+    except Exception as e:
+        print(f"Update lead error: {e}")
+    return {"status": "success"}
