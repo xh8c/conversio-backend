@@ -2,8 +2,8 @@ fastapi
 uvicorn
 beautifulsoup4
 requests
-chromadb
 groq
 python-dotenv
 supabase
 pydantic
+sentence-transformers

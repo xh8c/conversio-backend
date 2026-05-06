@@ -1,14 +1,17 @@
 import os
+import re
+import json
+import threading
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from groq import Groq
-import chromadb
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client
 from typing import Optional
+from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
@@ -18,7 +21,8 @@ supabase = create_client(
 )
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
 app = FastAPI()
 
 app.add_middleware(
@@ -29,69 +33,41 @@ app.add_middleware(
     allow_credentials=False,
 )
 
-def get_collection(user_id: str):
-    return chroma_client.get_or_create_collection(name=f"user_{user_id}")
-
+# --- Scraping ---
 def scrape_website(url: str) -> str:
-    import re
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
     }
     response = requests.get(url, timeout=5, headers=headers)
     response.encoding = response.apparent_encoding or "utf-8"
-    
     soup = BeautifulSoup(response.text, "html.parser")
-    
-    # Remove unwanted tags
-    for tag in soup(["script", "style", "nav", "footer", "head", 
-                     "header", "iframe", "noscript", "svg", "img",
-                     "button", "form", "input", "meta", "link"]):
+    for tag in soup(["script", "style", "nav", "footer", "head", "header", "iframe", "noscript", "svg", "img", "button", "form", "input", "meta", "link"]):
         tag.decompose()
-    
-    # Get text
     text = soup.get_text(separator=" ", strip=True)
-    
-    # Clean up
-    text = re.sub(r'[^\x20-\x7E]', ' ', text)  # keep only ASCII printable
-    text = re.sub(r'\s+', ' ', text).strip()     # collapse whitespace
-    text = re.sub(r'(.)\1{4,}', r'\1', text)     # remove repeated chars like ----
-    
+    text = re.sub(r'[^\x20-\x7E]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 def get_all_links(base_url: str) -> list:
-    import re
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        }
-        response = requests.get(base_url, timeout=10, headers=headers)
+        from urllib.parse import urlparse, urljoin
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        response = requests.get(base_url, timeout=5, headers=headers)
         soup = BeautifulSoup(response.text, "html.parser")
         links = set()
         links.add(base_url)
-        
-        # Get base domain
-        from urllib.parse import urlparse, urljoin
         base_domain = urlparse(base_url).netloc
-        
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
-            
-            # Skip anchors, javascript, mailto
             if href.startswith(("#", "javascript:", "mailto:", "tel:")):
                 continue
-            
-            # Build absolute URL
             full_url = urljoin(base_url, href)
             parsed = urlparse(full_url)
-            
-            # Only same domain, only http/https
             if parsed.netloc == base_domain and parsed.scheme in ("http", "https"):
                 clean = parsed._replace(fragment="", query="").geturl()
                 links.add(clean)
-        
         return list(links)
     except:
         return [base_url]
@@ -99,6 +75,41 @@ def get_all_links(base_url: str) -> list:
 def chunk_text(text: str, chunk_size: int = 500) -> list:
     words = text.split()
     return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
+
+# --- Vector Storage ---
+def store_chunks(user_id: str, chunks: list):
+    # Delete existing chunks for this user
+    supabase.table("document_chunks").delete().eq("user_id", user_id).execute()
+    
+    # Generate embeddings and store in batches
+    batch_size = 50
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i+batch_size]
+        embeddings = embedding_model.encode(batch).tolist()
+        rows = [
+            {
+                "user_id": user_id,
+                "content": chunk,
+                "embedding": embedding
+            }
+            for chunk, embedding in zip(batch, embeddings)
+        ]
+        supabase.table("document_chunks").insert(rows).execute()
+    print(f"Stored {len(chunks)} chunks for user {user_id}")
+
+def search_chunks(user_id: str, query: str, n: int = 5) -> list:
+    try:
+        query_embedding = embedding_model.encode([query])[0].tolist()
+        result = supabase.rpc("match_chunks", {
+            "query_embedding": query_embedding,
+            "match_user_id": user_id,
+            "match_count": n
+        }).execute()
+        if result.data:
+            return [row["content"] for row in result.data]
+    except Exception as e:
+        print(f"Search error: {e}")
+    return []
 
 # --- Request Models ---
 class TrainRequest(BaseModel):
@@ -121,90 +132,109 @@ class LeadRequest(BaseModel):
     timeline: Optional[str] = None
     urgency: Optional[str] = "low"
     conversation: Optional[str] = None
-# --- Routes ---
-import json
 
+class UpdateLeadRequest(BaseModel):
+    user_id: str
+    email: str
+    conversation_history: list = []
+
+# --- Routes ---
 @app.post("/train")
 def train(req: TrainRequest):
-    collection = get_collection(req.user_id)
-    links = get_all_links(req.url)
-    links = links[:20]
-    all_chunks = []
-    import signal
-
-    for link in links:
+    def run_training():
         try:
-            print(f"Scraping: {link}")
-            text = scrape_website(link)
-            all_chunks.extend(chunk_text(text))
-            print(f"Done: {link} — {len(all_chunks)} chunks so far")
-        except requests.exceptions.Timeout:
-            print(f"Timeout skipping: {link}")
-        except requests.exceptions.ConnectionError:
-            print(f"Connection error skipping: {link}")
-        except Exception as e:
-            print(f"Failed: {link} — {e}")
-    if all_chunks:
-        # Delete all existing chunks first
-        try:
-            existing = collection.get()
-            if existing and existing["ids"]:
-                collection.delete(ids=existing["ids"])
-        except Exception as e:
-            print(f"Delete error: {e}")
+            print(f"Training started for {req.user_id} on {req.url}")
+            links = get_all_links(req.url)
+            print(f"Found {len(links)} pages")
 
-        # Add fresh chunks
-        for i, chunk in enumerate(all_chunks):
-            collection.add(documents=[chunk], ids=[f"chunk_{i}_{req.user_id}"])
+            all_chunks = []
+            for link in links:
+                try:
+                    print(f"Scraping: {link}")
+                    text = scrape_website(link)
+                    all_chunks.extend(chunk_text(text))
+                    print(f"Done: {link} — {len(all_chunks)} chunks")
+                except requests.exceptions.Timeout:
+                    print(f"Timeout: {link}")
+                except Exception as e:
+                    print(f"Failed: {link} — {e}")
 
-    # Auto-generate FAQ buttons
-    faq_buttons = ["Our Services", "Pricing", "Location", "Contact Us"]
-    try:
-        sample_text = " ".join(all_chunks[:5])
-        faq_prompt = f"""Based on this business website content, generate exactly 4 short FAQ button labels visitors would most likely click.
+            if all_chunks:
+                store_chunks(req.user_id, all_chunks)
+
+            # Generate FAQ buttons
+            faq_buttons = ["Our Services", "Pricing", "Location", "Contact Us"]
+            try:
+                sample_text = " ".join(all_chunks[:5])
+                faq_prompt = f"""Based on this business website content, generate exactly 4 short FAQ button labels visitors would most likely click.
 
 Content: {sample_text[:2000]}
 
 Rules:
 - Each label must be 2-4 words maximum
-- Make them action-oriented or question-based  
 - Return ONLY a JSON array of 4 strings, nothing else
 - Example: ["Our Services", "Pricing", "Book Now", "Contact Us"]"""
 
-        faq_response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": faq_prompt}],
-            temperature=0.3,
-            max_tokens=100,
-        )
-        raw = faq_response.choices[0].message.content.strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        parsed = json.loads(raw)
-        if isinstance(parsed, list) and len(parsed) > 0:
-            faq_buttons = parsed[:4]
-    except Exception as e:
-        print(f"FAQ generation error: {e}")
-        print(f"FAQ buttons generated: {faq_buttons}")
+                faq_response = client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[{"role": "user", "content": faq_prompt}],
+                    temperature=0.3,
+                    max_tokens=100,
+                )
+                raw = faq_response.choices[0].message.content.strip()
+                raw = raw.replace("```json", "").replace("```", "").strip()
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    faq_buttons = parsed[:4]
+            except Exception as e:
+                print(f"FAQ error: {e}")
 
-    # Save to Supabase
+            # Save to Supabase
+            try:
+                existing = supabase.table("chatbot_settings").select("user_id").eq("user_id", req.user_id).execute()
+                update_data = {
+                    "faq_buttons": faq_buttons,
+                    "training_status": "complete",
+                }
+                if existing.data:
+                    supabase.table("chatbot_settings").update(update_data).eq("user_id", req.user_id).execute()
+                else:
+                    supabase.table("chatbot_settings").insert({"user_id": req.user_id, **update_data}).execute()
+            except Exception as e:
+                print(f"Settings save error: {e}")
+
+            print(f"Training complete for {req.user_id}")
+
+        except Exception as e:
+            print(f"Training error: {e}")
+            try:
+                supabase.table("chatbot_settings").update({"training_status": "error"}).eq("user_id", req.user_id).execute()
+            except:
+                pass
+
+    # Set status to training immediately
     try:
         existing = supabase.table("chatbot_settings").select("user_id").eq("user_id", req.user_id).execute()
         if existing.data:
-            supabase.table("chatbot_settings").update({"faq_buttons": faq_buttons}).eq("user_id", req.user_id).execute()
+            supabase.table("chatbot_settings").update({"training_status": "training"}).eq("user_id", req.user_id).execute()
         else:
-            supabase.table("chatbot_settings").insert({"user_id": req.user_id, "faq_buttons": faq_buttons}).execute()
-    except Exception as e:
-        print(f"FAQ save error: {e}")
+            supabase.table("chatbot_settings").insert({"user_id": req.user_id, "training_status": "training"}).execute()
+    except:
+        pass
 
-    return {"status": "success", "pages_scraped": len(links), "chunks_stored": len(all_chunks), "faq_buttons": faq_buttons}
+    thread = threading.Thread(target=run_training)
+    thread.daemon = True
+    thread.start()
+
+    return {"status": "training_started", "message": "Training started in background."}
 
 @app.post("/chat")
 def chat(req: ChatRequest):
-    collection = get_collection(req.user_id)
-    results = collection.query(query_texts=[req.question], n_results=3)
-    context = " ".join(results["documents"][0])[:2000]
-    contact_results = collection.query(query_texts=["contact phone email address booking"], n_results=2)
-    contact_context = " ".join(contact_results["documents"][0])[:800]
+    context_chunks = search_chunks(req.user_id, req.question, n=3)
+    context = " ".join(context_chunks)[:2000]
+
+    contact_chunks = search_chunks(req.user_id, "contact phone email address booking location", n=2)
+    contact_context = " ".join(contact_chunks)[:800]
 
     history_str = ""
     if req.conversation_history:
@@ -225,11 +255,10 @@ CONVERSATION:
 
 INSTRUCTIONS:
 - Answer using only business info above
-- Use bullet points for lists, short paragraphs otherwise
+- Use bullet points for lists
 - Be warm and conversational
-- If visitor shows buying intent, guide toward booking/contact
-- If you lack specific info, share contact details
-- Never say "based on context" or make up info
+- Guide toward booking/contact when appropriate
+- Never make up information
 
 VISITOR: {req.question}
 {req.bot_name}:"""
@@ -258,31 +287,38 @@ def capture_lead(req: LeadRequest):
         print(f"Lead error: {e}")
     return {"status": "success"}
 
-@app.get("/")
-def root():
-    return {"status": "Chatbot API is running"}
-
-@app.get("/settings/{user_id}")
-def get_settings(user_id: str):
+@app.post("/update-lead")
+def update_lead(req: UpdateLeadRequest):
     try:
-        result = supabase.table("chatbot_settings").select("*").eq("user_id", user_id).single().execute()
-        data = result.data
-        if not data:
-            return {}
-        return {
-            "botName": data.get("bot_name", "Assistant"),
-            "welcomeMessage": data.get("welcome_message", "Hi! How can I help you?"),
-            "fallbackMessage": data.get("fallback_message", "I don't have that information."),
-            "primaryColor": data.get("primary_color", "#6C63FF"),
-            "position": data.get("position", "bottom-right"),
-            "collectName": data.get("collect_name", True),
-            "collectEmail": data.get("collect_email", True),
-            "logoUrl": data.get("logo_url", ""),
-            "faqButtons": data.get("faq_buttons", []),
-        }
+        history_str = "\n".join([f"{'Visitor' if m['role'] == 'user' else 'Assistant'}: {m['content']}" for m in req.conversation_history])
+        extraction_prompt = f"""Extract lead information from this conversation. Return ONLY valid JSON.
+
+Conversation:
+{history_str}
+
+Return exactly:
+{{"intent": null, "budget": null, "timeline": null, "urgency": "low"}}"""
+
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": extraction_prompt}],
+            temperature=0.1,
+            max_tokens=100,
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        extracted = json.loads(raw)
+
+        update_data = {"conversation": json.dumps(req.conversation_history)}
+        if extracted.get("intent"): update_data["intent"] = extracted["intent"]
+        if extracted.get("budget"): update_data["budget"] = extracted["budget"]
+        if extracted.get("timeline"): update_data["timeline"] = extracted["timeline"]
+        if extracted.get("urgency"): update_data["urgency"] = extracted["urgency"]
+
+        supabase.table("leads").update(update_data).eq("user_id", req.user_id).eq("email", req.email).execute()
     except Exception as e:
-        print(f"Settings error: {e}")
-        return {}
+        print(f"Update lead error: {e}")
+    return {"status": "success"}
 
 @app.post("/extract")
 def extract_lead_info(req: ChatRequest):
@@ -292,18 +328,13 @@ def extract_lead_info(req: ChatRequest):
             role = "Visitor" if msg["role"] == "user" else "Assistant"
             history_str += f"{role}: {msg['content']}\n"
 
-    extraction_prompt = f"""Extract lead information from this conversation. Return ONLY valid JSON, nothing else.
+    extraction_prompt = f"""Extract lead information from this conversation. Return ONLY valid JSON.
 
 Conversation:
 {history_str}
 
-Return exactly this structure with null for missing fields:
-{{"intent": null, "budget": null, "timeline": null, "urgency": "low"}}
-
-urgency must be "high", "medium", or "low".
-intent = what they want in a few words.
-budget = amount mentioned or null.
-timeline = when they need it or null."""
+Return exactly:
+{{"intent": null, "budget": null, "timeline": null, "urgency": "low"}}"""
 
     try:
         response = client.chat.completions.create(
@@ -319,49 +350,29 @@ timeline = when they need it or null."""
         print(f"Extraction error: {e}")
         return {"intent": None, "budget": None, "timeline": None, "urgency": "low"}
 
-class UpdateLeadRequest(BaseModel):
-    user_id: str
-    email: str
-    conversation_history: list = []
-
-@app.post("/update-lead")
-def update_lead(req: UpdateLeadRequest):
+@app.get("/settings/{user_id}")
+def get_settings(user_id: str):
     try:
-        history_str = "\n".join([f"{'Visitor' if m['role'] == 'user' else 'Assistant'}: {m['content']}" for m in req.conversation_history])
-        
-        extraction_prompt = f"""Extract lead information from this conversation. Return ONLY valid JSON.
-
-Conversation:
-{history_str}
-
-Return exactly this structure with null for missing fields:
-{{"intent": null, "budget": null, "timeline": null, "urgency": "low"}}
-
-urgency must be "high", "medium", or "low".
-intent = what they want in a few words.
-budget = amount mentioned or null.
-timeline = when they need it or null."""
-
-        response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": extraction_prompt}],
-            temperature=0.1,
-            max_tokens=100,
-        )
-        raw = response.choices[0].message.content.strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        extracted = json.loads(raw)
-
-        update_data = {
-            "conversation": json.dumps(req.conversation_history),
+        result = supabase.table("chatbot_settings").select("*").eq("user_id", user_id).single().execute()
+        data = result.data
+        if not data:
+            return {}
+        return {
+            "botName": data.get("bot_name", "Assistant"),
+            "welcomeMessage": data.get("welcome_message", "Hi! How can I help you today?"),
+            "fallbackMessage": data.get("fallback_message", "I don't have that information."),
+            "primaryColor": data.get("primary_color", "#6C63FF"),
+            "position": data.get("position", "bottom-right"),
+            "collectName": data.get("collect_name", True),
+            "collectEmail": data.get("collect_email", True),
+            "logoUrl": data.get("logo_url", ""),
+            "faqButtons": data.get("faq_buttons", []),
+            "trainingStatus": data.get("training_status", "idle"),
         }
-        if extracted.get("intent"): update_data["intent"] = extracted["intent"]
-        if extracted.get("budget"): update_data["budget"] = extracted["budget"]
-        if extracted.get("timeline"): update_data["timeline"] = extracted["timeline"]
-        if extracted.get("urgency"): update_data["urgency"] = extracted["urgency"]
-
-        supabase.table("leads").update(update_data).eq("user_id", req.user_id).eq("email", req.email).execute()
-
     except Exception as e:
-        print(f"Update lead error: {e}")
-    return {"status": "success"}
+        print(f"Settings error: {e}")
+        return {}
+
+@app.get("/")
+def root():
+    return {"status": "Chatbot API is running"}
