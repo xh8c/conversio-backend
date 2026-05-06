@@ -201,14 +201,14 @@ Rules:
 @app.post("/chat")
 def chat(req: ChatRequest):
     collection = get_collection(req.user_id)
-    results = collection.query(query_texts=[req.question], n_results=5)
-    context = " ".join(results["documents"][0])
-    contact_results = collection.query(query_texts=["contact phone email address booking"], n_results=3)
-    contact_context = " ".join(contact_results["documents"][0])
+    results = collection.query(query_texts=[req.question], n_results=3)
+    context = " ".join(results["documents"][0])[:2000]
+    contact_results = collection.query(query_texts=["contact phone email address booking"], n_results=2)
+    contact_context = " ".join(contact_results["documents"][0])[:800]
 
     history_str = ""
     if req.conversation_history:
-        for msg in req.conversation_history[-6:]:
+        for msg in req.conversation_history[-3:]:
             role = "Visitor" if msg["role"] == "user" else req.bot_name
             history_str += f"{role}: {msg['content']}\n"
 
