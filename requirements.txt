@@ -6,4 +6,4 @@ groq
 python-dotenv
 supabase
 pydantic
-sentence-transformers
+fastembed

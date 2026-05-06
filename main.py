@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client
 from typing import Optional
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 
 load_dotenv()
 
@@ -21,7 +21,7 @@ supabase = create_client(
 )
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
 app = FastAPI()
 
@@ -85,7 +85,8 @@ def store_chunks(user_id: str, chunks: list):
     batch_size = 50
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i+batch_size]
-        embeddings = embedding_model.encode(batch).tolist()
+        embeddings = list(embedding_model.embed(batch))
+        embeddings = [e.tolist() for e in embeddings]
         rows = [
             {
                 "user_id": user_id,
@@ -99,7 +100,7 @@ def store_chunks(user_id: str, chunks: list):
 
 def search_chunks(user_id: str, query: str, n: int = 5) -> list:
     try:
-        query_embedding = embedding_model.encode([query])[0].tolist()
+        query_embedding = list(embedding_model.embed([query]))[0].tolist()
         result = supabase.rpc("match_chunks", {
             "query_embedding": query_embedding,
             "match_user_id": user_id,
@@ -148,6 +149,11 @@ def train(req: TrainRequest):
             print(f"Found {len(links)} pages")
 
             all_chunks = []
+            # Filter out image/binary URLs
+            skip_extensions = ('.webp', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.pdf', '.zip', '.mp4', '.mp3')
+            links = [l for l in links if not any(l.lower().endswith(ext) for ext in skip_extensions)]
+            print(f"Filtered to {len(links)} pages after removing images")
+
             for link in links:
                 try:
                     print(f"Scraping: {link}")
