@@ -95,7 +95,7 @@ def train(req: TrainRequest):
             all_chunks.extend(chunk_text(text))
         except:
             pass
-if all_chunks:
+    if all_chunks:
         # Delete all existing chunks first
         try:
             existing = collection.get()
