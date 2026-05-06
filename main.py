@@ -40,7 +40,7 @@ def scrape_website(url: str) -> str:
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
     }
-    response = requests.get(url, timeout=10, headers=headers)
+    response = requests.get(url, timeout=5, headers=headers)
     response.encoding = response.apparent_encoding or "utf-8"
     
     soup = BeautifulSoup(response.text, "html.parser")
@@ -130,12 +130,18 @@ def train(req: TrainRequest):
     links = get_all_links(req.url)
     links = links[:20]
     all_chunks = []
+    import signal
+
     for link in links:
         try:
             print(f"Scraping: {link}")
             text = scrape_website(link)
             all_chunks.extend(chunk_text(text))
-            print(f"Done: {link}")
+            print(f"Done: {link} — {len(all_chunks)} chunks so far")
+        except requests.exceptions.Timeout:
+            print(f"Timeout skipping: {link}")
+        except requests.exceptions.ConnectionError:
+            print(f"Connection error skipping: {link}")
         except Exception as e:
             print(f"Failed: {link} — {e}")
     if all_chunks:
