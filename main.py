@@ -132,10 +132,12 @@ def train(req: TrainRequest):
     all_chunks = []
     for link in links:
         try:
+            print(f"Scraping: {link}")
             text = scrape_website(link)
             all_chunks.extend(chunk_text(text))
-        except:
-            pass
+            print(f"Done: {link}")
+        except Exception as e:
+            print(f"Failed: {link} — {e}")
     if all_chunks:
         # Delete all existing chunks first
         try:
