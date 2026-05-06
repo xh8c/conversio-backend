@@ -95,12 +95,18 @@ def train(req: TrainRequest):
             all_chunks.extend(chunk_text(text))
         except:
             pass
-    if all_chunks:
+if all_chunks:
+        # Delete all existing chunks first
+        try:
+            existing = collection.get()
+            if existing and existing["ids"]:
+                collection.delete(ids=existing["ids"])
+        except Exception as e:
+            print(f"Delete error: {e}")
+
+        # Add fresh chunks
         for i, chunk in enumerate(all_chunks):
-            try:
-                collection.add(documents=[chunk], ids=[f"chunk_{i}_{req.user_id}"])
-            except:
-                collection.update(documents=[chunk], ids=[f"chunk_{i}_{req.user_id}"])
+            collection.add(documents=[chunk], ids=[f"chunk_{i}_{req.user_id}"])
 
     # Auto-generate FAQ buttons
     faq_buttons = ["Our Services", "Pricing", "Location", "Contact Us"]
